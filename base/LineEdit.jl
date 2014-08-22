@@ -770,6 +770,20 @@ function keymap_gen_body(dict, subdict::Dict, level)
     return block
 end
 
+function keymap_fcn(keymap)
+    maxlen = mapreduce(length, max, keys(keymap))
+    c = string(read(terminal(s), Char))
+    while length(c) < maxlen
+        if c in keys(keymap)
+            update_key_repeats(s, c)
+            return keymap[c]
+        end
+        c *= string(read(terminal(s), Char))
+    end
+    # didn't match, return default
+    return keymap["\0"]
+end
+
 update_key_repeats(s, keystroke) = nothing
 function update_key_repeats(s::MIState, keystroke)
     s.key_repeats  = s.previous_key == keystroke ? s.key_repeats + 1 : 0
@@ -835,7 +849,7 @@ end
 keymap_prepare(keymaps::Expr) = keymap_prepare(eval(keymaps))
 keymap_prepare(keymaps::Dict) = keymap_prepare([keymaps])
 function keymap_prepare{D<:Dict}(keymaps::Array{D})
-    push!(keymaps, {"*"=>:(error("Unrecognized input"))})
+    push!(keymaps, {"*"=>(s,data,c)->(error("Unrecognized input"))})
     keymaps = map(normalize_keymap, keymaps)
     map(fix_conflicts!, keymaps)
     keymaps
@@ -1025,27 +1039,27 @@ end
 function setup_search_keymap(hp)
     p = HistoryPrompt(hp)
     pkeymap = {
-        "^R"      => :(LineEdit.history_set_backward(data, true); LineEdit.history_next_result(s, data)),
-        "^S"      => :(LineEdit.history_set_backward(data, false); LineEdit.history_next_result(s, data)),
+        "^R"      => (s,data)->(LineEdit.history_set_backward(data, true); LineEdit.history_next_result(s, data)),
+        "^S"      => (s,data)->(LineEdit.history_set_backward(data, false); LineEdit.history_next_result(s, data)),
         '\r'      => s->accept_result(s, p),
         '\n'      => '\r',
         # Limited form of tab completions
-        '\t'      => :(LineEdit.complete_line(s); LineEdit.update_display_buffer(s, data)),
-        "^L"      => :(Terminals.clear(LineEdit.terminal(s)); LineEdit.update_display_buffer(s, data)),
+        '\t'      => (s,data)->(LineEdit.complete_line(s); LineEdit.update_display_buffer(s, data)),
+        "^L"      => (s,data)->(Terminals.clear(LineEdit.terminal(s)); LineEdit.update_display_buffer(s, data)),
 
         # Backspace/^H
-        '\b'      => :(LineEdit.edit_backspace(data.query_buffer) ?
+        '\b'      => (s,data)->(LineEdit.edit_backspace(data.query_buffer) ?
                         LineEdit.update_display_buffer(s, data) : beep(LineEdit.terminal(s))),
         127       => '\b',
         # Meta Backspace
-        "\e\b"    => :(LineEdit.edit_delete_prev_word(data.query_buffer) ?
+        "\e\b"    => (s,data)->(LineEdit.edit_delete_prev_word(data.query_buffer) ?
                         LineEdit.update_display_buffer(s, data) : beep(LineEdit.terminal(s))),
         "\e\x7f"  => "\e\b",
         # Word erase to whitespace
-        "^W"      => :(LineEdit.edit_werase(data.query_buffer) ?
+        "^W"      => (s,data)->(LineEdit.edit_werase(data.query_buffer) ?
                         LineEdit.update_display_buffer(s, data) : beep(LineEdit.terminal(s))),
         # ^C and ^D
-        "^C"      => :(LineEdit.edit_clear(data.query_buffer);
+        "^C"      => (s,data)->(LineEdit.edit_clear(data.query_buffer);
                        LineEdit.edit_clear(data.response_buffer);
                        LineEdit.update_display_buffer(s, data);
                        LineEdit.reset_state(data.histprompt.hp);
@@ -1057,9 +1071,9 @@ function setup_search_keymap(hp)
         # ^K
         11        => s->transition(s, state(s, p).parent),
         # ^Y
-        25        => :(LineEdit.edit_yank(s); LineEdit.update_display_buffer(s, data)),
+        25        => (s,data)->(LineEdit.edit_yank(s); LineEdit.update_display_buffer(s, data)),
         # ^U
-        21        => :(LineEdit.edit_clear(data.query_buffer);
+        21        => (s,data)->(LineEdit.edit_clear(data.query_buffer);
                        LineEdit.edit_clear(data.response_buffer);
                        LineEdit.update_display_buffer(s, data)),
         # Right Arrow
@@ -1086,20 +1100,20 @@ function setup_search_keymap(hp)
         1         => s->(accept_result(s, p); move_line_start(s); refresh_line(s)),
         # ^E
         5         => s->(accept_result(s, p); move_line_end(s); refresh_line(s)),
-        "^Z"      => :(return :suspend),
+        "^Z"      => s->(return :suspend),
         # Try to catch all Home/End keys
         "\e[H"    => s->(accept_result(s, p); move_input_start(s); refresh_line(s)),
         "\e[F"    => s->(accept_result(s, p); move_input_end(s); refresh_line(s)),
         # Use ^N and ^P to change search directions and iterate through results
-        "^N"      => :(LineEdit.history_set_backward(data, false); LineEdit.history_next_result(s, data)),
-        "^P"      => :(LineEdit.history_set_backward(data, true); LineEdit.history_next_result(s, data)),
+        "^N"      => (s,data)->(LineEdit.history_set_backward(data, false); LineEdit.history_next_result(s, data)),
+        "^P"      => (s,data)->(LineEdit.history_set_backward(data, true); LineEdit.history_next_result(s, data)),
         # Bracketed paste mode
         "\e[200~" => quote
             ps = LineEdit.state(s, LineEdit.mode(s))
             input = readuntil(ps.terminal, "\e[201~")[1:(end-6)]
             LineEdit.edit_insert(data.query_buffer, input); LineEdit.update_display_buffer(s, data)
         end,
-        "*"       => :(LineEdit.edit_insert(data.query_buffer, c1); LineEdit.update_display_buffer(s, data))
+        "*"       => (s,data,c)->(LineEdit.edit_insert(data.query_buffer, c); LineEdit.update_display_buffer(s, data))
     }
     p.keymap_func = @eval @LineEdit.keymap $([pkeymap, escape_defaults])
     keymap = {
@@ -1176,7 +1190,7 @@ const default_keymap =
         refresh_line(s)
     end,
     # Enter
-    '\r' => quote
+    '\r' => s->begin
         if LineEdit.on_enter(s) || (eof(LineEdit.buffer(s)) && s.key_repeats > 1)
             LineEdit.commit_line(s)
             return :done
@@ -1192,7 +1206,7 @@ const default_keymap =
     "\e\b" => edit_delete_prev_word,
     "\e\x7f" => "\e\b",
     # ^D
-    4 => quote
+    4 => s->begin
         if LineEdit.buffer(s).size > 0
             LineEdit.edit_delete(s)
         else
@@ -1213,10 +1227,10 @@ const default_keymap =
     # Ctrl-Right Arrow
     "\e[1;5C" => "\ef",
     # Meta Enter
-    "\e\r" => :(LineEdit.edit_insert(s, '\n')),
+    "\e\r" => s->(LineEdit.edit_insert(s, '\n')),
     "\e\n" => "\e\r",
     # Simply insert it into the buffer by default
-    "*" => :(LineEdit.edit_insert(s, c1)),
+    "*" => (s,data,c)->(LineEdit.edit_insert(s, c)),
     # ^U
     21 => edit_clear,
     # ^K
@@ -1224,14 +1238,14 @@ const default_keymap =
     # ^Y
     25 => edit_yank,
     # ^A
-    1 => :(LineEdit.move_line_start(s); LineEdit.refresh_line(s)),
+    1 => s->(LineEdit.move_line_start(s); LineEdit.refresh_line(s)),
     # ^E
-    5 => :(LineEdit.move_line_end(s); LineEdit.refresh_line(s)),
+    5 => s->(LineEdit.move_line_end(s); LineEdit.refresh_line(s)),
     # Try to catch all Home/End keys
-    "\e[H"  => :(LineEdit.move_input_start(s); LineEdit.refresh_line(s)),
-    "\e[F"  => :(LineEdit.move_input_end(s); LineEdit.refresh_line(s)),
+    "\e[H"  => s->(LineEdit.move_input_start(s); LineEdit.refresh_line(s)),
+    "\e[F"  => s->(LineEdit.move_input_end(s); LineEdit.refresh_line(s)),
     # ^L
-    12 => :(Terminals.clear(LineEdit.terminal(s)); LineEdit.refresh_line(s)),
+    12 => s->(Terminals.clear(LineEdit.terminal(s)); LineEdit.refresh_line(s)),
     # ^W
     23 => edit_werase,
     # Meta D
@@ -1247,7 +1261,7 @@ const default_keymap =
         transition(s, :reset)
         refresh_line(s)
     end,
-    "^Z" => :(return :suspend),
+    "^Z" => s->(return :suspend),
     # Right Arrow
     "\e[C" => edit_move_right,
     # Left Arrow
@@ -1269,23 +1283,23 @@ const default_keymap =
         end
         edit_insert(s, input)
     end,
-    "^T"      => edit_transpose,
+    "^T" => edit_transpose,
 }
 
 function history_keymap(hist)
     return {
         # ^P
-        16 => :(LineEdit.history_prev(s, $hist)),
+        16 => s->(LineEdit.history_prev(s, hist)),
         # ^N
-        14 => :(LineEdit.history_next(s, $hist)),
+        14 => s->(LineEdit.history_next(s, hist)),
         # Up Arrow
-        "\e[A" => :(LineEdit.edit_move_up(s) || LineEdit.history_prev(s, $hist)),
+        "\e[A" => s->(LineEdit.edit_move_up(s) || LineEdit.history_prev(s, hist)),
         # Down Arrow
-        "\e[B" => :(LineEdit.edit_move_down(s) || LineEdit.history_next(s, $hist)),
+        "\e[B" => s->(LineEdit.edit_move_down(s) || LineEdit.history_next(s, hist)),
         # Page Up
-        "\e[5~" => :(LineEdit.history_prev_prefix(s, $hist)),
+        "\e[5~" => s->(LineEdit.history_prev_prefix(s, hist)),
         # Page Down
-        "\e[6~" => :(LineEdit.history_next_prefix(s, $hist))
+        "\e[6~" => s->(LineEdit.history_next_prefix(s, hist))
     }
 end
 
