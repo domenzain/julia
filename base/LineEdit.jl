@@ -684,36 +684,40 @@ function normalize_key(key::String)
     return takebuf_string(buf)
 end
 
-# Turn a Dict{Any,Any} into a Dict{Char,Any}
+# Turn a Dict{Any,Any} into a Dict{String,Function}
 # For now we use \0 to represent unknown chars so that they are sorted before everything else
 # If we ever actually want to match \0 in input, this will have to be reworked
 function normalize_keymap(keymap::Dict)
-    ret = Dict{Char,Any}()
+    ret = Dict{String,Function}()
     for key in keys(keymap)
         newkey = normalize_key(key)
-        current = ret
-        i = start(newkey)
-        while !done(newkey, i)
-            c, i = next(newkey, i)
-            if haskey(current, c)
-                if !isa(current[c], Dict)
-                    println(ret)
-                    error("Conflicting Definitions for keyseq " * escape_string(newkey) * " within one keymap")
-                end
-            elseif done(newkey, i)
-                if isa(keymap[key], String)
-                    current[c] = normalize_key(keymap[key])
-                else
-                    current[c] = keymap[key]
-                end
-                break
-            else
-                current[c] = Dict{Char,Any}()
-            end
-            current = current[c]
+        if haskey(ret, newkey)
+            println(ret)
+            error("Conflicting Definitions for keyseq " * escape_string(newkey) * " within one keymap")
         end
+
+        # keymap[key] can be a Char, String, Function, (or Expr)
+        # convert all of these into a Function callable with (MIState/PromptState, AbstractRepl, HistoryProvider)
+        ret[newkey] = normalize_action(keymap[key], ret)
     end
     ret
+end
+
+normalize_action(c::Union(Char,String), keymap::Dict) = keymap(keymap[normalize_key(c)])
+normalize_action(expr::Expr, keymap::Dict) = @eval (s, data, hp) -> $expr
+normalize_action(n::Nothing, keymap::Dict) = (s, data, hp) -> nothing
+function normalize_action(f::Function, keymap::Dict)
+    # create a function which is callable with (MIState/PromptState, AbstractRepl, HistoryProvider)
+    numargs = f.env.max_args
+    if numargs == 0
+        return (s, data, hp) -> f()
+    elseif numargs == 1
+        return (s, data, hp) -> f(s)
+    elseif numargs == 2
+        return (s, data, hp) -> f(s,data)
+    else
+        return f
+    end
 end
 
 keymap_gen_body(keymaps, body::Expr, level) = body
@@ -741,41 +745,12 @@ function keymap_gen_body(keymaps, body::String, level)
     error("No exact match for redirected key $body")
 end
 
-keymap_gen_body(a, b) = keymap_gen_body(a, b, 1)
-function keymap_gen_body(dict, subdict::Dict, level)
-    block = Expr(:block)
-    bc = symbol("c" * string(level))
-    push!(block.args, :($bc = read(LineEdit.terminal(s), Char)))
-
-    last_if = Expr(:block)
-    haskey(subdict, '\0') && push!(last_if.args, keymap_gen_body(dict, subdict['\0'], level+1))
-    level == 1 && push!(last_if.args, :(LineEdit.update_key_repeats(s, [$bc])))
-
-    for c in keys(subdict)
-        c == '\0' && continue
-        cblock = Expr(:if, :($bc == $c))
-        cthen = Expr(:block)
-        if !isa(subdict[c], Dict)
-            cs = [symbol("c" * string(i)) for i=1:level]
-            push!(cthen.args, :(LineEdit.update_key_repeats(s, [$(cs...)])))
-        end
-        push!(cthen.args, keymap_gen_body(dict, subdict[c], level+1))
-
-        push!(cblock.args, cthen)
-        push!(cblock.args, last_if)
-        last_if = cblock
-    end
-
-    push!(block.args, last_if)
-    return block
-end
-
 function keymap_fcn(keymap)
     maxlen = mapreduce(length, max, keys(keymap))
     c = string(read(terminal(s), Char))
     while length(c) < maxlen
         if c in keys(keymap)
-            update_key_repeats(s, c)
+            update_key_repeats(s, last(c))
             return keymap[c]
         end
         c *= string(read(terminal(s), Char))
