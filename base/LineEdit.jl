@@ -684,36 +684,40 @@ function normalize_key(key::String)
     return takebuf_string(buf)
 end
 
-# Turn a Dict{Any,Any} into a Dict{Char,Any}
+# Turn a Dict{Any,Any} into a Dict{String,Function}
 # For now we use \0 to represent unknown chars so that they are sorted before everything else
 # If we ever actually want to match \0 in input, this will have to be reworked
 function normalize_keymap(keymap::Dict)
-    ret = Dict{Char,Any}()
+    ret = Dict{String,Function}()
     for key in keys(keymap)
         newkey = normalize_key(key)
-        current = ret
-        i = start(newkey)
-        while !done(newkey, i)
-            c, i = next(newkey, i)
-            if haskey(current, c)
-                if !isa(current[c], Dict)
-                    println(ret)
-                    error("Conflicting Definitions for keyseq " * escape_string(newkey) * " within one keymap")
-                end
-            elseif done(newkey, i)
-                if isa(keymap[key], String)
-                    current[c] = normalize_key(keymap[key])
-                else
-                    current[c] = keymap[key]
-                end
-                break
-            else
-                current[c] = Dict{Char,Any}()
-            end
-            current = current[c]
+        if haskey(ret, newkey)
+            println(ret)
+            error("Conflicting Definitions for keyseq " * escape_string(newkey) * " within one keymap")
         end
+
+        # keymap[key] can be a Char, String, Function, (or Expr)
+        # convert all of these into a Function callable with (MIState/PromptState, AbstractRepl, HistoryProvider)
+        ret[newkey] = normalize_action(keymap[key], ret)
     end
     ret
+end
+
+normalize_action(c::Union(Char,String), keymap::Dict) = keymap(keymap[normalize_key(c)])
+normalize_action(expr::Expr, keymap::Dict) = @eval (s, data, hp) -> $expr
+normalize_action(n::Nothing, keymap::Dict) = (s, data, hp) -> nothing
+function normalize_action(f::Function, keymap::Dict)
+    # create a function which is callable with (MIState/PromptState, AbstractRepl, HistoryProvider)
+    numargs = f.env.max_args
+    if numargs == 0
+        return (s, data, hp) -> f()
+    elseif numargs == 1
+        return (s, data, hp) -> f(s)
+    elseif numargs == 2
+        return (s, data, hp) -> f(s,data)
+    else
+        return f
+    end
 end
 
 keymap_gen_body(keymaps, body::Expr, level) = body
@@ -741,33 +745,18 @@ function keymap_gen_body(keymaps, body::String, level)
     error("No exact match for redirected key $body")
 end
 
-keymap_gen_body(a, b) = keymap_gen_body(a, b, 1)
-function keymap_gen_body(dict, subdict::Dict, level)
-    block = Expr(:block)
-    bc = symbol("c" * string(level))
-    push!(block.args, :($bc = read(LineEdit.terminal(s), Char)))
-
-    last_if = Expr(:block)
-    haskey(subdict, '\0') && push!(last_if.args, keymap_gen_body(dict, subdict['\0'], level+1))
-    level == 1 && push!(last_if.args, :(LineEdit.update_key_repeats(s, [$bc])))
-
-    for c in keys(subdict)
-        c == '\0' && continue
-        cblock = Expr(:if, :($bc == $c))
-        cthen = Expr(:block)
-        if !isa(subdict[c], Dict)
-            cs = [symbol("c" * string(i)) for i=1:level]
-            push!(cthen.args, :(LineEdit.update_key_repeats(s, [$(cs...)])))
+function keymap_fcn(keymap)
+    maxlen = mapreduce(length, max, keys(keymap))
+    c = string(read(terminal(s), Char))
+    while length(c) < maxlen
+        if c in keys(keymap)
+            update_key_repeats(s, last(c))
+            return keymap[c]
         end
-        push!(cthen.args, keymap_gen_body(dict, subdict[c], level+1))
-
-        push!(cblock.args, cthen)
-        push!(cblock.args, last_if)
-        last_if = cblock
+        c *= string(read(terminal(s), Char))
     end
-
-    push!(block.args, last_if)
-    return block
+    # didn't match, return default
+    return keymap["\0"]
 end
 
 update_key_repeats(s, keystroke) = nothing
@@ -835,7 +824,7 @@ end
 keymap_prepare(keymaps::Expr) = keymap_prepare(eval(keymaps))
 keymap_prepare(keymaps::Dict) = keymap_prepare([keymaps])
 function keymap_prepare{D<:Dict}(keymaps::Array{D})
-    push!(keymaps, {"*"=>:(error("Unrecognized input"))})
+    push!(keymaps, {"*"=>(s,data,c)->(error("Unrecognized input"))})
     keymaps = map(normalize_keymap, keymaps)
     map(fix_conflicts!, keymaps)
     keymaps
@@ -1025,27 +1014,27 @@ end
 function setup_search_keymap(hp)
     p = HistoryPrompt(hp)
     pkeymap = {
-        "^R"      => :(LineEdit.history_set_backward(data, true); LineEdit.history_next_result(s, data)),
-        "^S"      => :(LineEdit.history_set_backward(data, false); LineEdit.history_next_result(s, data)),
+        "^R"      => (s,data)->(LineEdit.history_set_backward(data, true); LineEdit.history_next_result(s, data)),
+        "^S"      => (s,data)->(LineEdit.history_set_backward(data, false); LineEdit.history_next_result(s, data)),
         '\r'      => s->accept_result(s, p),
         '\n'      => '\r',
         # Limited form of tab completions
-        '\t'      => :(LineEdit.complete_line(s); LineEdit.update_display_buffer(s, data)),
-        "^L"      => :(Terminals.clear(LineEdit.terminal(s)); LineEdit.update_display_buffer(s, data)),
+        '\t'      => (s,data)->(LineEdit.complete_line(s); LineEdit.update_display_buffer(s, data)),
+        "^L"      => (s,data)->(Terminals.clear(LineEdit.terminal(s)); LineEdit.update_display_buffer(s, data)),
 
         # Backspace/^H
-        '\b'      => :(LineEdit.edit_backspace(data.query_buffer) ?
+        '\b'      => (s,data)->(LineEdit.edit_backspace(data.query_buffer) ?
                         LineEdit.update_display_buffer(s, data) : beep(LineEdit.terminal(s))),
         127       => '\b',
         # Meta Backspace
-        "\e\b"    => :(LineEdit.edit_delete_prev_word(data.query_buffer) ?
+        "\e\b"    => (s,data)->(LineEdit.edit_delete_prev_word(data.query_buffer) ?
                         LineEdit.update_display_buffer(s, data) : beep(LineEdit.terminal(s))),
         "\e\x7f"  => "\e\b",
         # Word erase to whitespace
-        "^W"      => :(LineEdit.edit_werase(data.query_buffer) ?
+        "^W"      => (s,data)->(LineEdit.edit_werase(data.query_buffer) ?
                         LineEdit.update_display_buffer(s, data) : beep(LineEdit.terminal(s))),
         # ^C and ^D
-        "^C"      => :(LineEdit.edit_clear(data.query_buffer);
+        "^C"      => (s,data)->(LineEdit.edit_clear(data.query_buffer);
                        LineEdit.edit_clear(data.response_buffer);
                        LineEdit.update_display_buffer(s, data);
                        LineEdit.reset_state(data.histprompt.hp);
@@ -1057,9 +1046,9 @@ function setup_search_keymap(hp)
         # ^K
         11        => s->transition(s, state(s, p).parent),
         # ^Y
-        25        => :(LineEdit.edit_yank(s); LineEdit.update_display_buffer(s, data)),
+        25        => (s,data)->(LineEdit.edit_yank(s); LineEdit.update_display_buffer(s, data)),
         # ^U
-        21        => :(LineEdit.edit_clear(data.query_buffer);
+        21        => (s,data)->(LineEdit.edit_clear(data.query_buffer);
                        LineEdit.edit_clear(data.response_buffer);
                        LineEdit.update_display_buffer(s, data)),
         # Right Arrow
@@ -1086,20 +1075,20 @@ function setup_search_keymap(hp)
         1         => s->(accept_result(s, p); move_line_start(s); refresh_line(s)),
         # ^E
         5         => s->(accept_result(s, p); move_line_end(s); refresh_line(s)),
-        "^Z"      => :(return :suspend),
+        "^Z"      => s->(return :suspend),
         # Try to catch all Home/End keys
         "\e[H"    => s->(accept_result(s, p); move_input_start(s); refresh_line(s)),
         "\e[F"    => s->(accept_result(s, p); move_input_end(s); refresh_line(s)),
         # Use ^N and ^P to change search directions and iterate through results
-        "^N"      => :(LineEdit.history_set_backward(data, false); LineEdit.history_next_result(s, data)),
-        "^P"      => :(LineEdit.history_set_backward(data, true); LineEdit.history_next_result(s, data)),
+        "^N"      => (s,data)->(LineEdit.history_set_backward(data, false); LineEdit.history_next_result(s, data)),
+        "^P"      => (s,data)->(LineEdit.history_set_backward(data, true); LineEdit.history_next_result(s, data)),
         # Bracketed paste mode
         "\e[200~" => quote
             ps = LineEdit.state(s, LineEdit.mode(s))
             input = readuntil(ps.terminal, "\e[201~")[1:(end-6)]
             LineEdit.edit_insert(data.query_buffer, input); LineEdit.update_display_buffer(s, data)
         end,
-        "*"       => :(LineEdit.edit_insert(data.query_buffer, c1); LineEdit.update_display_buffer(s, data))
+        "*"       => (s,data,c)->(LineEdit.edit_insert(data.query_buffer, c); LineEdit.update_display_buffer(s, data))
     }
     p.keymap_func = @eval @LineEdit.keymap $([pkeymap, escape_defaults])
     keymap = {
@@ -1176,7 +1165,7 @@ const default_keymap =
         refresh_line(s)
     end,
     # Enter
-    '\r' => quote
+    '\r' => s->begin
         if LineEdit.on_enter(s) || (eof(LineEdit.buffer(s)) && s.key_repeats > 1)
             LineEdit.commit_line(s)
             return :done
@@ -1192,7 +1181,7 @@ const default_keymap =
     "\e\b" => edit_delete_prev_word,
     "\e\x7f" => "\e\b",
     # ^D
-    4 => quote
+    4 => s->begin
         if LineEdit.buffer(s).size > 0
             LineEdit.edit_delete(s)
         else
@@ -1213,10 +1202,10 @@ const default_keymap =
     # Ctrl-Right Arrow
     "\e[1;5C" => "\ef",
     # Meta Enter
-    "\e\r" => :(LineEdit.edit_insert(s, '\n')),
+    "\e\r" => s->(LineEdit.edit_insert(s, '\n')),
     "\e\n" => "\e\r",
     # Simply insert it into the buffer by default
-    "*" => :(LineEdit.edit_insert(s, c1)),
+    "*" => (s,data,c)->(LineEdit.edit_insert(s, c)),
     # ^U
     21 => edit_clear,
     # ^K
@@ -1224,14 +1213,14 @@ const default_keymap =
     # ^Y
     25 => edit_yank,
     # ^A
-    1 => :(LineEdit.move_line_start(s); LineEdit.refresh_line(s)),
+    1 => s->(LineEdit.move_line_start(s); LineEdit.refresh_line(s)),
     # ^E
-    5 => :(LineEdit.move_line_end(s); LineEdit.refresh_line(s)),
+    5 => s->(LineEdit.move_line_end(s); LineEdit.refresh_line(s)),
     # Try to catch all Home/End keys
-    "\e[H"  => :(LineEdit.move_input_start(s); LineEdit.refresh_line(s)),
-    "\e[F"  => :(LineEdit.move_input_end(s); LineEdit.refresh_line(s)),
+    "\e[H"  => s->(LineEdit.move_input_start(s); LineEdit.refresh_line(s)),
+    "\e[F"  => s->(LineEdit.move_input_end(s); LineEdit.refresh_line(s)),
     # ^L
-    12 => :(Terminals.clear(LineEdit.terminal(s)); LineEdit.refresh_line(s)),
+    12 => s->(Terminals.clear(LineEdit.terminal(s)); LineEdit.refresh_line(s)),
     # ^W
     23 => edit_werase,
     # Meta D
@@ -1247,7 +1236,7 @@ const default_keymap =
         transition(s, :reset)
         refresh_line(s)
     end,
-    "^Z" => :(return :suspend),
+    "^Z" => s->(return :suspend),
     # Right Arrow
     "\e[C" => edit_move_right,
     # Left Arrow
@@ -1269,23 +1258,23 @@ const default_keymap =
         end
         edit_insert(s, input)
     end,
-    "^T"      => edit_transpose,
+    "^T" => edit_transpose,
 }
 
 function history_keymap(hist)
     return {
         # ^P
-        16 => :(LineEdit.history_prev(s, $hist)),
+        16 => s->(LineEdit.history_prev(s, hist)),
         # ^N
-        14 => :(LineEdit.history_next(s, $hist)),
+        14 => s->(LineEdit.history_next(s, hist)),
         # Up Arrow
-        "\e[A" => :(LineEdit.edit_move_up(s) || LineEdit.history_prev(s, $hist)),
+        "\e[A" => s->(LineEdit.edit_move_up(s) || LineEdit.history_prev(s, hist)),
         # Down Arrow
-        "\e[B" => :(LineEdit.edit_move_down(s) || LineEdit.history_next(s, $hist)),
+        "\e[B" => s->(LineEdit.edit_move_down(s) || LineEdit.history_next(s, hist)),
         # Page Up
-        "\e[5~" => :(LineEdit.history_prev_prefix(s, $hist)),
+        "\e[5~" => s->(LineEdit.history_prev_prefix(s, hist)),
         # Page Down
-        "\e[6~" => :(LineEdit.history_next_prefix(s, $hist))
+        "\e[6~" => s->(LineEdit.history_next_prefix(s, hist))
     }
 end
 
